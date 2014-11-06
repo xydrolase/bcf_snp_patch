@@ -1,3 +1,6 @@
+# Target
+bcf_snp_patch
+
 # Compiled Object files
 *.slo
 *.lo

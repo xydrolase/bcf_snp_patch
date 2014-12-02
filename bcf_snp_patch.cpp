@@ -2,6 +2,10 @@
 #include <fstream>
 #include "bcf_snp_patch.h"
 
+#include <boost/program_options.hpp>
+
+namespace progopt = boost::program_options;
+
 extern "C" {
 #include "htslib/vcf.h" // variant calling
 #include "htslib/sam.h" // alignment
@@ -10,9 +14,9 @@ extern "C" {
 
 void dump_bcf_header(bcf_hdr_t *hdr);
 void dump_bcf_hrecs(bcf_hrec_t **hrecs, int nhrec);
-void load_snps_bcf(const char *bcf_fpath, snp_map_t &smap);
+void load_snps_bcf(const char *bcf_fpath, snp_map_t &smap, bsp_options &opt);
 void output_error_file(const char *bam_fpath, snp_map_t &smap, 
-		std::unordered_set<std::string> &fltr);
+		std::unordered_set<std::string> &fltr, bsp_options &opt);
 static inline void print_seq_error(std::ostream &ss, uint32_t is_rev, std::string rid, 
 		int rlen, int epos, char ref, char err);
 
@@ -23,6 +27,62 @@ static inline char bam_4bit2char(uint8_t b4)
 	// i.e. 1 -> 0, 2 -> 1, 4 -> 2, 8 -> 3
 	int idx = __builtin_ctz(b4); 
 	return sam_nucleotides[idx & 3];
+}
+
+static void parse_options(int argc, char *argv[], bsp_options &opt)
+{
+	progopt::options_description opts_desc("Allowed options:");
+	opts_desc.add_options()
+	("help,h", "print usage information")
+	("output,o", progopt::value(&opt.out_file), 
+	 "redirect output to the file <arg> (instead of stdout)")
+	("min_depth,d", progopt::value(&opt.min_read_depth)->default_value(0), 
+	 "maximum read depth for a SNP to be considered valid")
+	("max_depth,D", progopt::value(&opt.max_read_depth)->default_value(65536), 
+	 "maximum read depth for a SNP to be considered valid");
+
+	progopt::options_description pdesc("Positional options:");
+	pdesc.add_options()
+	("bcf_file", progopt::value(&opt.bcf_file)->required(), 
+	 "BCF formatted variant calling file")
+	("bam_file", progopt::value(&opt.bam_file)->required(),
+	 "BAM formatted alignment results")
+	("rid_file", progopt::value(&opt.rid_file)->required(),
+	 "a list of read ids serving as read filters");
+
+	progopt::options_description all_desc("All options:");
+	all_desc.add(opts_desc).add(pdesc);
+
+	progopt::positional_options_description pos_desc;
+	pos_desc.add("bcf_file", 1);
+	pos_desc.add("bam_file", 1);
+	pos_desc.add("rid_file", 1);
+
+	progopt::variables_map vm;
+
+	// usage information
+	std::stringstream usage;
+	usage << std::endl<< "Usage: " << argv[0] 
+		<< " [options] <bcf_file> <bam_file> <rid_file>"
+		<< std::endl << std::endl << opts_desc << std::endl;
+
+	try {
+		progopt::store(progopt::command_line_parser(argc, argv)
+				.options(all_desc)
+				.positional(pos_desc).run(), vm);
+		progopt::notify(vm);
+	}
+	catch(std::exception& e) {
+		std::cerr << "ERROR: " << e.what() << std::endl;
+		std::cerr << usage.str();
+		exit(1);
+	}
+
+	if (vm.count("help")) {
+		std::cout << usage.str();
+		std::cout << opts_desc << std::endl;
+		exit(0);
+	}
 }
 
 int main(int argc, char *argv[])
@@ -60,22 +120,18 @@ int main(int argc, char *argv[])
 	} bcf_hrec_t;
 #endif
 
-	if (argc < 4) {
-		std::cerr << "ERROR: Too few arguments." << std::endl <<
-			"Usage: " << argv[0] << " <bcf_file> <rid_file> <bam_file>" << 
-			std::endl;
-		exit(1);
-	}
+	bsp_options opt;
+	parse_options(argc, argv, opt);
 
 	std::cerr << "Processing VCF/BCF formatted SNPs..." << std::endl;
 	snp_map_t bcf_map;
-	load_snps_bcf(argv[1], bcf_map);
+	load_snps_bcf(opt.bcf_file.c_str(), bcf_map, opt);
 	std::cerr << bcf_map.size() << " SNPs loaded." << std::endl;
 
 	std::cerr << "Loading filtering read identifiers..." << std::endl;
 	// set of read identifiers (extended) as filter
 	std::unordered_set<std::string> rid_fltr_set;
-	std::ifstream rid_ifs(argv[2]);
+	std::ifstream rid_ifs(opt.rid_file.c_str());
 	std::string rid;
 	while (std::getline(rid_ifs, rid)) {
 		if (rid.back() == ' ')
@@ -86,9 +142,8 @@ int main(int argc, char *argv[])
 	std::cerr << rid_fltr_set.size() << " read identifiers loaded." << std::endl;
 	
 	std::cerr << "Processing SAM/BAM formatted alignments..." << std::endl;
-	output_error_file(argv[3], bcf_map, rid_fltr_set);
+	output_error_file(opt.bam_file.c_str(), bcf_map, rid_fltr_set, opt);
 	std::cerr << "Alignments processed." << std::endl;
-
 }
 
 
@@ -108,9 +163,15 @@ void print_seq_error(std::ostream &ss, uint32_t is_rev, std::string rid,
 }
 
 void output_error_file(const char *bam_fpath, snp_map_t &smap, 
-		std::unordered_set<std::string> &fltr)
+		std::unordered_set<std::string> &fltr, bsp_options &opt)
 {
 	const char aux_md[2] = {'M', 'D'};
+
+	std::ofstream ofs_error;
+	std::ostream &ostrm_error = opt.out_file.empty() ? std::cout : ofs_error;
+	if (!opt.out_file.empty()) {
+		ofs_error.open(opt.out_file.c_str(), std::ofstream::out | std::ofstream::trunc);
+	}
 
 	BGZF *bam_fp = bgzf_open(bam_fpath, "r");
 	bam_hdr_t *hdr = bam_hdr_read(bam_fp);
@@ -146,7 +207,7 @@ void output_error_file(const char *bam_fpath, snp_map_t &smap,
 		uint64_t mism_pos = (uint64_t) tpos;
 
 		// CIGAR is not quite useful in this program (other than computing the 
-		// reada length) , but might be useful if we'd implement a program 
+		// read length) , but might be useful if we'd implement a program 
 		// manipulating BAM/SAM file in C++.
 		uint32_t *cigar = bam_get_cigar(aln);
 		int rlen = bam_cigar2rlen(aln->core.n_cigar, cigar);
@@ -184,7 +245,7 @@ void output_error_file(const char *bam_fpath, snp_map_t &smap,
 
 				if (snp == smap.end()) {
 					// output the error directly
-					print_seq_error(std::cout, flag & BAM_FREVERSE, erid.str(), 
+					print_seq_error(ostrm_error, flag & BAM_FREVERSE, erid.str(), 
 							rlen, epos, pc, obs_epos_base);
 				}
 				else {
@@ -192,7 +253,7 @@ void output_error_file(const char *bam_fpath, snp_map_t &smap,
 					uint32_t _allele_flag = (snp->second >> 2);
 					if ((_allele_flag & (1 << (base_to_bits(obs_epos_base)))) == 0) {
 						// not true SNP, likely a sequencing error
-						print_seq_error(std::cout, flag & BAM_FREVERSE, erid.str(), 
+						print_seq_error(ostrm_error, flag & BAM_FREVERSE, erid.str(), 
 								rlen, epos, pc, obs_epos_base);
 					}
 				}
@@ -215,9 +276,12 @@ void output_error_file(const char *bam_fpath, snp_map_t &smap,
 		}
 	}
 
+	if (!opt.out_file.empty()) {
+		ofs_error.close();
+	}
 }
 
-void load_snps_bcf(const char *bcf_fpath, snp_map_t &smap)
+void load_snps_bcf(const char *bcf_fpath, snp_map_t &smap, bsp_options &opt)
 {
 	vcfFile *bcf_fp = bcf_open(bcf_fpath, "r");
 	bcf_hdr_t *hdr = bcf_hdr_read(bcf_fp);
@@ -233,7 +297,12 @@ void load_snps_bcf(const char *bcf_fpath, snp_map_t &smap)
 	int INFO_INDEL_IDX = bcf_hdr_id2int(hdr, BCF_DT_ID, "INDEL");
 	if (INFO_INDEL_IDX == -1) {
 		std::cerr << "ERROR: Cannot extract index for 'INDEL' tag." << std::endl;
-		exit(1);
+		exit(10);
+	}
+	int INFO_DP_IDX = bcf_hdr_id2int(hdr, BCF_DT_ID, "DP");
+	if (INFO_DP_IDX == -1) {
+		std::cerr << "ERROR: Cannot extract index for 'DP' tag." << std::endl;
+		exit(10);
 	}
 
 	bcf1_t *vcf_line = NULL;
@@ -284,12 +353,18 @@ void load_snps_bcf(const char *bcf_fpath, snp_map_t &smap)
 		 * and bcf_hdr_int2id() for ID-->KEY
 		 */
 
-		/* skip INDELs */
+		// skip INDELs
 		if (bcf_get_info_id(vcf_line, INFO_INDEL_IDX) != NULL) continue;
 
-		/* cache all the SNPs */
+		// check read depth
+		bcf_info_t *bi = bcf_get_info_id(vcf_line, INFO_DP_IDX);
+		if (bi == NULL) continue; // no read depth information, skip
+		register int vcf_dp = bi->v1.i;
+		if (vcf_dp < opt.min_read_depth || vcf_dp > opt.max_read_depth) continue;
+
+		// cache all the SNPs
 		bcf_dec_t *d = &(vcf_line->d);
-		// first allele is the REF(erfence)
+		// first allele is the REF(erence)
 		char ref = d->allele[0][0];
 		uint32_t _allele_flag = 0;
 

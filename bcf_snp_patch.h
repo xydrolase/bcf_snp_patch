@@ -21,4 +21,14 @@ const char pmr_complements[4] = {'T', 'G', 'A', 'C'};
 // nucleotides in samtools's order
 const char sam_nucleotides[4] = {'A', 'C', 'G', 'T'};
 
+typedef struct _bsp_options {
+	std::string bcf_file;
+	std::string bam_file;
+	std::string rid_file;
+
+	std::string out_file;
+	int min_read_depth;	
+	int max_read_depth;
+} bsp_options;
+
 #endif

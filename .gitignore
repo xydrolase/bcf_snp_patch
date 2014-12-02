@@ -29,3 +29,6 @@ bcf_snp_patch
 *.exe
 *.out
 *.app
+
+# Vim swap files
+*.sw[po]
